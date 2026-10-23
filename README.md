@@ -14,6 +14,72 @@ Personal AI assistant for your TradingView Desktop charts. Connects Claude Code 
 > [!CAUTION]
 > This tool accesses undocumented internal TradingView APIs via the Electron debug interface. These can change or break without notice in any TradingView update. Pin your TradingView Desktop version if stability matters to you.
 
+## About this fork
+
+This is a fork of [tradesdontlie/tradingview-mcp](https://github.com/tradesdontlie/tradingview-mcp) (MIT). It adds an optional **pipe transport** that removes the TCP debug port, and fixes six bugs reported upstream. Everything else, including all 84 tools, works exactly as in the original.
+
+| Branch | What it adds |
+|---|---|
+| `feat/pipe-transport` | Pipe transport (opt-in; port mode stays the default) |
+| `fix/confirmed-bugs` | Pipe transport + the six bug fixes below. **Use this one.** |
+
+### Pipe transport: no open debug port
+
+The original connects to TradingView through `--remote-debugging-port=9222`. That port has no authentication: while it is open, **any program on your computer** can take full control of TradingView, including your logged-in session and the trading panel.
+
+With the pipe transport, a small broker launches TradingView with `--remote-debugging-pipe` instead. The debugger is reached through a private pipe between the two processes, and the broker shares it with the MCP through a Unix socket that only your user account can open:
+
+```
+Claude Code session ┐
+another session     ┼─► cdp.sock (0600, in a 0700 folder) ─► broker ─► pipe ─► TradingView
+tv CLI              ┘
+```
+
+| | Port mode (default) | Pipe mode |
+|---|---|---|
+| TradingView flag | `--remote-debugging-port=9222` | `--remote-debugging-pipe` |
+| TCP port opened | `127.0.0.1:9222` | none |
+| Who can control TradingView | any local program | your user account only (socket is `0600`) |
+| Shared by several Claude sessions | yes | yes (the broker routes each client's sessions separately) |
+
+**Turn it on** by adding `TV_CDP_TRANSPORT=pipe` to the server's environment, for example in `~/.claude.json`:
+
+```json
+"tradingview": {
+  "type": "stdio",
+  "command": "node",
+  "args": ["/path/to/tradingview-mcp/src/server.js"],
+  "env": { "TV_CDP_TRANSPORT": "pipe" }
+}
+```
+
+Then restart Claude Code and start TradingView with the `tv_launch` tool (or `TV_CDP_TRANSPORT=pipe tv launch`). `tv_launch` starts the broker, and the broker starts TradingView. `tv_health_check` reports `"transport": "pipe"`.
+
+- **Socket:** `~/Library/Application Support/tradingview-mcp/cdp.sock` on macOS, `$XDG_RUNTIME_DIR/tradingview-mcp/cdp.sock` on Linux. Override with `TV_PIPE_SOCKET`.
+- **Broker log:** `broker.log` in the same folder.
+- **Manual start:** `node src/pipe/broker.js [--socket <path>] [--tv <binary>]`.
+- **Lifetime:** the broker exits when TradingView quits. Opening TradingView from the Dock or Start menu starts it without any debugger, so use `tv_launch`.
+- **Limits:** only one program can launch TradingView, so tools that start it themselves (or expect port 9222, such as `scripts/pine_*.js`) don't work at the same time. Windows uses a named pipe, but pipe mode has only been tested on macOS.
+
+Verified live on TradingView Desktop 3.4.1 (Electron 41) on macOS: every tool group works over the pipe, and `lsof` shows no TCP listener from TradingView or the broker.
+
+### Bug fixes
+
+| Issue | Problem | Fix |
+|---|---|---|
+| [#527](https://github.com/tradesdontlie/tradingview-mcp/issues/527) | Boolean parameters read the string `"false"` as **true**, so `alert_delete` with `delete_all: "false"` deleted every alert, and `tv_launch` with `kill_existing: "false"` still killed TradingView | All 8 boolean parameters accept only real booleans or the words `true`/`false`, and reject anything else. `alert_delete` also refuses a non-boolean `delete_all`. |
+| [#475](https://github.com/tradesdontlie/tradingview-mcp/issues/475) | `pine_new` wrote its template into whichever script was open, so the next save overwrote it | `pine_new` creates a real untitled script through the editor's **Create new** menu and checks that the editor switched. If the open script has unsaved changes, it cancels TradingView's prompt and stops. |
+| [#395](https://github.com/tradesdontlie/tradingview-mcp/issues/395) | `pine_compile` / `pine_smart_compile` / `pine_save` could save the source over a different saved script | They refuse when the editor holds a saved script whose name differs from the title declared in the source. Override on purpose with `allow_title_mismatch: true` (CLI: `--allow-title-mismatch`). |
+| [#477](https://github.com/tradesdontlie/tradingview-mcp/issues/477) | `ui_mouse_click` sent left clicks as "no button pressed" and reported success | Uses the correct button mask (left=1, right=2, middle=4); double clicks fire a real `dblclick`. |
+| [#476](https://github.com/tradesdontlie/tradingview-mcp/issues/476) | `ui_evaluate` returned `{}` for async expressions | Promises are awaited and their resolved value returned. |
+| [#553](https://github.com/tradesdontlie/tradingview-mcp/issues/553) | `tab_new` clicked the new-tab button's wrapper, which does nothing | Clicks the button itself, with fallbacks. |
+
+The fixes for #527, #553, #475 and #395 follow the approach of upstream PRs [#528](https://github.com/tradesdontlie/tradingview-mcp/pull/528), [#553](https://github.com/tradesdontlie/tradingview-mcp/pull/553) and [#555](https://github.com/tradesdontlie/tradingview-mcp/pull/555). All six were verified live on TradingView Desktop 3.4.1 through the MCP server.
+
+### Tests
+
+`npm run test:unit` covers the additions: `tests/pipe.test.js` (framing, broker routing, session isolation, cleanup, socket permissions), `tests/schema.test.js` (#527), `tests/ui_fixes.test.js` (#477, #476, #553) and `tests/pine_save_guard.test.js` (#395, #475).
+
 ## How It Works (and why it's safe to run)
 
 This tool does not connect to TradingView's servers, modify any TradingView files, or intercept any network traffic. It communicates exclusively with your locally running TradingView Desktop instance via Chrome DevTools Protocol (CDP) — a standard debugging interface built into all Chromium/Electron applications by Google, including VS Code, Slack, and Discord.
