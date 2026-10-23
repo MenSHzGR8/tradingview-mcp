@@ -1,4 +1,5 @@
 import CDP from 'chrome-remote-interface';
+import { connectBroker, listPipeTargets, attachPipeTarget } from './pipe/client.js';
 
 let client = null;
 let targetInfo = null;
@@ -7,6 +8,36 @@ let targetInfo = null;
 // resolves to ::1 first, and Electron's --remote-debugging-port only listens on IPv4.
 export const CDP_HOST = process.env.TV_CDP_HOST || process.env.CDP_HOST || '127.0.0.1';
 export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9222;
+// 'port' (default): TradingView started with --remote-debugging-port, reached over TCP.
+// 'pipe': TradingView started by the pipe broker (src/pipe/broker.js) with
+// --remote-debugging-pipe; reached through a user-only Unix socket, no TCP port.
+export const CDP_TRANSPORT = (process.env.TV_CDP_TRANSPORT || 'port').toLowerCase() === 'pipe' ? 'pipe' : 'port';
+export const isPipeTransport = () => CDP_TRANSPORT === 'pipe';
+
+let broker = null;
+async function getBroker() {
+  if (!broker || broker.isClosed) broker = await connectBroker();
+  return broker;
+}
+
+/**
+ * All debuggable targets as { id, type, title, url } (the /json/list shape),
+ * over whichever transport is configured.
+ */
+export async function listTargets() {
+  if (isPipeTransport()) return listPipeTargets(await getBroker());
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  return resp.json();
+}
+
+/**
+ * A CDP client attached to one target. Same surface either way:
+ * client.Runtime.evaluate(...), client.Page.*, client.Input.*, client.close().
+ */
+export async function openTargetClient(targetId) {
+  if (isPipeTransport()) return attachPipeTarget(await getBroker(), targetId);
+  return CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
+}
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
 
@@ -75,7 +106,7 @@ export async function connect(targetId = null) {
           : 'No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      client = await openTargetClient(target.id);
 
       // Enable required domains
       await client.Runtime.enable();
@@ -108,8 +139,7 @@ export async function reconnectTo(targetId) {
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await listTargets();
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
@@ -117,8 +147,7 @@ async function findChartTarget() {
 }
 
 async function findTargetById(id) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await listTargets();
   return targets.find(t => t.id === id) || null;
 }
 
