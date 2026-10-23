@@ -60,6 +60,7 @@ Then restart Claude Code and start TradingView with the `tv_launch` tool (or `TV
 - **Socket:** `~/Library/Application Support/tradingview-mcp/cdp.sock` on macOS, `$XDG_RUNTIME_DIR/tradingview-mcp/cdp.sock` on Linux. Override with `TV_PIPE_SOCKET`.
 - **Broker log:** `broker.log` in the same folder.
 - **Manual start:** `node src/pipe/broker.js [--socket <path>] [--tv <binary>]`.
+- **Joins a running broker:** if the Awesome Charts app (or another session) already runs the broker, `tv_launch` joins it instead of restarting TradingView.
 - **Lifetime:** the broker exits when TradingView quits. Opening TradingView from the Dock or Start menu starts it without any debugger, so use `tv_launch`.
 - **Limits:** only one program can launch TradingView, so tools that start it themselves (or expect port 9222, such as `scripts/pine_*.js`) don't work at the same time. Windows uses a named pipe, but pipe mode has only been tested on macOS.
 

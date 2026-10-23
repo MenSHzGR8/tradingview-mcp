@@ -215,6 +215,7 @@ function _resolveLaunchDeps(deps) {
     readdirSync: deps?.readdirSync || readdirSync,
     delay: deps?.delay || ((ms) => new Promise((r) => setTimeout(r, ms))),
     probeCdp: deps?.probeCdp || _probeCdp,
+    probePipe: deps?.probePipe || _pipeBrokerVersion,
   };
 }
 
@@ -441,11 +442,11 @@ async function launchPipe({ kill_existing, _deps } = {}) {
   const socketPath = defaultSocketPath();
   const platform = process.platform;
 
-  if (kill_existing === false) {
-    const running = await _pipeBrokerVersion(socketPath);
-    if (running) {
-      return { success: true, transport: 'pipe', already_running: true, socket: socketPath, browser: running.product };
-    }
+  // A broker that already answers (this MCP's own, or the Awesome Charts app's) owns TradingView:
+  // join it rather than killing TradingView, whatever kill_existing says.
+  const running = await deps.probePipe(socketPath);
+  if (running) {
+    return { success: true, transport: 'pipe', already_running: true, socket: socketPath, browser: running.product };
   }
 
   const tvPath = findTradingViewPath({ _deps });
@@ -456,7 +457,7 @@ async function launchPipe({ kill_existing, _deps } = {}) {
       else deps.execSync('pkill -f TradingView', { timeout: 5000 });
     } catch { /* may not be running */ }
     // An old broker exits once its TradingView is gone; wait for its socket to go quiet.
-    for (let i = 0; i < 10 && await _pipeBrokerVersion(socketPath); i++) await deps.delay(500);
+    for (let i = 0; i < 10 && await deps.probePipe(socketPath); i++) await deps.delay(500);
     await deps.delay(1000);
   }
 
@@ -475,7 +476,7 @@ async function launchPipe({ kill_existing, _deps } = {}) {
 
   for (let i = 0; i < 20; i++) {
     await deps.delay(1000);
-    const info = await _pipeBrokerVersion(socketPath);
+    const info = await deps.probePipe(socketPath);
     if (info) {
       return {
         success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: child.pid,
