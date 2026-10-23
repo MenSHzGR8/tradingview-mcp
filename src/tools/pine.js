@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { jsonResult } from './_format.js';
+import { booleanParam } from './_schema.js';
 import * as core from '../core/pine.js';
+
+const allowTitleMismatch = () => booleanParam().optional().describe(
+  'Save even though the editor is bound to a saved script whose name differs from the indicator()/strategy()/library() title in the source (default false: refuse, since that would overwrite the other script)',
+);
 
 export function registerPineTools(server) {
   server.tool('pine_get_source', 'Get current Pine Script source code from the editor', {}, async () => {
@@ -15,8 +20,10 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_compile', 'Compile / add the current Pine Script to the chart', {}, async () => {
-    try { return jsonResult(await core.compile()); }
+  server.tool('pine_compile', 'Compile / add the current Pine Script to the chart. May save the script; refuses if that would overwrite a different saved script.', {
+    allow_title_mismatch: allowTitleMismatch(),
+  }, async ({ allow_title_mismatch }) => {
+    try { return jsonResult(await core.compile({ allowTitleMismatch: allow_title_mismatch === true })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -25,8 +32,10 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_save', 'Save the current Pine Script (Ctrl+S)', {}, async () => {
-    try { return jsonResult(await core.save()); }
+  server.tool('pine_save', 'Save the current Pine Script (Ctrl+S). Refuses if that would overwrite a different saved script.', {
+    allow_title_mismatch: allowTitleMismatch(),
+  }, async ({ allow_title_mismatch }) => {
+    try { return jsonResult(await core.save({ allowTitleMismatch: allow_title_mismatch === true })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -35,12 +44,14 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_smart_compile', 'Intelligent compile: detects button, compiles, checks errors, reports study changes', {}, async () => {
-    try { return jsonResult(await core.smartCompile()); }
+  server.tool('pine_smart_compile', 'Intelligent compile: detects button, compiles, checks errors, reports study changes. May save; refuses if that would overwrite a different saved script.', {
+    allow_title_mismatch: allowTitleMismatch(),
+  }, async ({ allow_title_mismatch }) => {
+    try { return jsonResult(await core.smartCompile({ allowTitleMismatch: allow_title_mismatch === true })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_new', 'Create a new blank Pine Script', {
+  server.tool('pine_new', 'Create a new, unsaved Pine Script via the editor\'s "Create new" menu. Fails (and writes nothing) rather than reusing the open script.', {
     type: z.enum(['indicator', 'strategy', 'library']).describe('Type of script to create'),
   }, async ({ type }) => {
     try { return jsonResult(await core.newScript({ type })); }

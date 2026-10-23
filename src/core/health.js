@@ -1,10 +1,13 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT } from '../connection.js';
-import { existsSync, cpSync, rmSync, readdirSync } from 'fs';
+import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT, CDP_TRANSPORT, isPipeTransport } from '../connection.js';
+import { existsSync, cpSync, rmSync, readdirSync, mkdirSync, openSync, closeSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { dirname, basename, join } from 'path';
+import { fileURLToPath } from 'url';
+import { connectBroker } from '../pipe/client.js';
+import { defaultSocketPath, brokerLogPath, stateDir } from '../pipe/paths.js';
 
 // Best-effort git-pull update check: compare local HEAD to origin's default
 // branch on GitHub. Never throws — returns null on any failure (offline,
@@ -71,6 +74,7 @@ export async function healthCheck() {
   return {
     success: true,
     cdp_connected: true,
+    transport: CDP_TRANSPORT,
     target_id: target.id,
     target_url: target.url,
     target_title: target.title,
@@ -283,10 +287,13 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
   return dstExe;
 }
 
-export async function launch({ port, kill_existing, _deps } = {}) {
+/**
+ * Locate the TradingView Desktop binary (standard paths, MSIX, PATH, Spotlight).
+ * Throws with a manual-launch hint if it cannot be found.
+ */
+export function findTradingViewPath({ _deps, port } = {}) {
   const deps = _resolveLaunchDeps(_deps);
   const cdpPort = port || CDP_PORT;
-  const killFirst = kill_existing !== false;
   const platform = process.platform;
 
   const pathMap = {
@@ -348,6 +355,16 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   if (!tvPath) {
     throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.join(', ')}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
   }
+  return tvPath;
+}
+
+export async function launch({ port, kill_existing, _deps } = {}) {
+  if (isPipeTransport()) return launchPipe({ kill_existing, _deps });
+  const deps = _resolveLaunchDeps(_deps);
+  const cdpPort = port || CDP_PORT;
+  const killFirst = kill_existing !== false;
+  const platform = process.platform;
+  let tvPath = findTradingViewPath({ _deps, port: cdpPort });
 
   const killExisting = async () => {
     try {
@@ -399,3 +416,77 @@ export async function launch({ port, kill_existing, _deps } = {}) {
     warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
   };
 }
+
+const BROKER_SCRIPT = fileURLToPath(new URL('../pipe/broker.js', import.meta.url));
+
+async function _pipeBrokerVersion(socketPath) {
+  let conn = null;
+  try {
+    conn = await connectBroker(socketPath);
+    return await conn.send('Browser.getVersion');
+  } catch {
+    return null;
+  } finally {
+    conn?.close();
+  }
+}
+
+/**
+ * Pipe-transport launch: start the broker (src/pipe/broker.js) detached, which
+ * launches TradingView with --remote-debugging-pipe and serves CDP on a
+ * user-only Unix socket. No TCP debug port is opened.
+ */
+async function launchPipe({ kill_existing, _deps } = {}) {
+  const deps = _resolveLaunchDeps(_deps);
+  const socketPath = defaultSocketPath();
+  const platform = process.platform;
+
+  if (kill_existing === false) {
+    const running = await _pipeBrokerVersion(socketPath);
+    if (running) {
+      return { success: true, transport: 'pipe', already_running: true, socket: socketPath, browser: running.product };
+    }
+  }
+
+  const tvPath = findTradingViewPath({ _deps });
+
+  if (kill_existing !== false) {
+    try {
+      if (platform === 'win32') deps.execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
+      else deps.execSync('pkill -f TradingView', { timeout: 5000 });
+    } catch { /* may not be running */ }
+    // An old broker exits once its TradingView is gone; wait for its socket to go quiet.
+    for (let i = 0; i < 10 && await _pipeBrokerVersion(socketPath); i++) await deps.delay(500);
+    await deps.delay(1000);
+  }
+
+  mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+  const logPath = brokerLogPath();
+  const logFd = openSync(logPath, 'a');
+  let child;
+  try {
+    child = deps.spawn(process.execPath, [BROKER_SCRIPT, '--socket', socketPath, '--tv', tvPath], {
+      detached: true, stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+  } finally {
+    closeSync(logFd);
+  }
+
+  for (let i = 0; i < 20; i++) {
+    await deps.delay(1000);
+    const info = await _pipeBrokerVersion(socketPath);
+    if (info) {
+      return {
+        success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: child.pid,
+        socket: socketPath, browser: info.product, user_agent: info.userAgent, broker_log: logPath,
+      };
+    }
+  }
+  return {
+    success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: child.pid, socket: socketPath, cdp_ready: false,
+    warning: `Broker started but TradingView is not answering yet. Try tv_health_check in a few seconds; broker log: ${logPath}`,
+  };
+}
+
+export { isPipeTransport };

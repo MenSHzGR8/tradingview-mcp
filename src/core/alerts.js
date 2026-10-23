@@ -95,11 +95,16 @@ export async function list() {
 }
 
 export async function deleteAlerts({ delete_all, alert_ids, alert_id } = {}) {
+  // Deleting every alert is irreversible: require a real boolean true, never a
+  // truthy string such as "false" (issue #527).
+  if (delete_all !== undefined && typeof delete_all !== 'boolean') {
+    throw new Error(`delete_all must be a boolean, got ${JSON.stringify(delete_all)}`);
+  }
   // Resolve the set of alert ids to delete.
   let ids = [];
   if (Array.isArray(alert_ids)) ids = ids.concat(alert_ids);
   if (alert_id != null) ids.push(alert_id);
-  if (delete_all) {
+  if (delete_all === true) {
     const listed = await list();
     ids = (listed.alerts || []).map((a) => a.alert_id);
   }
