@@ -11,6 +11,23 @@
  */
 import { getClient, reconnectTo, listTargets, openTargetClient } from '../connection.js';
 
+// Clicks the shell's new-tab <button>. A bare [class*="create-new-tab"] matched
+// the wrapper div.create-new-tab-button-container first, and clicking the
+// wrapper does nothing (issue #553, Desktop 3.4.1). Exported for tests; runs in
+// the shell window, so it must stay self-contained.
+export const NEW_TAB_BUTTON_CLICK = function clickNewTabButton(doc) {
+  doc = doc || globalThis.document;
+  var btn = doc.querySelector('button.create-new-tab-button')
+    || doc.querySelector('button[aria-label="New tab"]');
+  if (!btn) {
+    var wrapper = doc.querySelector('[class*="create-new-tab"]');
+    btn = wrapper && (wrapper.tagName === 'BUTTON' ? wrapper : wrapper.querySelector('button'));
+  }
+  if (!btn) return false;
+  btn.click();
+  return true;
+}.toString();
+
 /**
  * List all open chart tabs (CDP page targets).
  */
@@ -114,14 +131,7 @@ export async function newTab({ layout, name } = {}) {
   if (!landing) {
     shellCounts = await withShell(async (evalIn) => {
       const before = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
-      const clicked = await evalIn(`
-        (function() {
-          var btn = document.querySelector('[class*="create-new-tab"]');
-          if (!btn) return false;
-          btn.click();
-          return true;
-        })()
-      `);
+      const clicked = await evalIn(`(${NEW_TAB_BUTTON_CLICK})()`);
       if (!clicked) throw new Error('New-tab button not found in shell window.');
       await new Promise(r => setTimeout(r, 1500));
       const after = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);

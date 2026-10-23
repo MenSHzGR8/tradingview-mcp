@@ -73,6 +73,95 @@ export async function ensurePineEditorOpen() {
   return false;
 }
 
+// ── Editor identity, menus and the save guard (issues #475, #395) ──
+
+const TITLE_BUTTON_SELECTOR = '[data-qa-id="pine-script-title-button"]';
+const SCRIPT_TYPE_MENU_LABELS = { indicator: /^Indicator/, strategy: /^Strategy/, library: /^Library/ };
+const NEW_SCRIPT_TIMEOUT_MS = 5000;
+
+/**
+ * Which script the Pine Editor is bound to: its displayed title, the Monaco model URI
+ * (a fresh UUID per opened/created script) and the current source.
+ */
+async function getEditorIdentity() {
+  return evaluate(`
+    (function() {
+      var titleBtn = document.querySelector('${TITLE_BUTTON_SELECTOR}');
+      var m = ${FIND_MONACO};
+      if (!titleBtn || !m) return null;
+      var model = m.editor.getModel();
+      return {
+        title: titleBtn.textContent.trim(),
+        modelUri: model ? model.uri.toString() : null,
+        source: m.editor.getValue(),
+      };
+    })()
+  `);
+}
+
+async function pollUntil(check, timeoutMs = 3000, intervalMs = 200) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await check();
+    if (result) return result;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+async function closeMenus() {
+  const c = await getClient();
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
+}
+
+/** Clicks Cancel on TradingView's "Save script before switching?" prompt. Returns true if it was showing. */
+async function cancelUnsavedChangesDialog() {
+  return evaluate(`
+    (function() {
+      var dontSave = document.querySelector('[data-qa-id="dontSave-btn"]');
+      if (!dontSave || dontSave.offsetParent === null) return false;
+      var container = dontSave.parentElement;
+      for (var i = 0; i < 6 && container; i++) {
+        var buttons = container.querySelectorAll('button');
+        for (var j = 0; j < buttons.length; j++) {
+          if (/^cancel$/i.test(buttons[j].textContent.trim())) { buttons[j].click(); return true; }
+        }
+        container = container.parentElement;
+      }
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      return true;
+    })()
+  `);
+}
+
+/** Title string from the indicator()/strategy()/library() declaration, or null if not found. */
+export function getDeclaredTitle(source) {
+  const match = /^\s*(?:indicator|strategy|library)\s*\(\s*(?:title\s*=\s*)?(["'])((?:(?!\1).)*)\1/m.exec(source || '');
+  return match ? match[2] : null;
+}
+
+/**
+ * Save-guard decision. Returns an error message when saving would write the source
+ * into a different saved script than the one it declares (the source was injected
+ * into the wrong script), otherwise null. Untitled scripts are always allowed.
+ */
+export function checkSaveTarget(identity, { allowTitleMismatch = false } = {}) {
+  if (allowTitleMismatch) return null;
+  if (!identity) return 'Could not read the Pine Editor script title; refusing to save.';
+  if (/^untitled/i.test(identity.title)) return null;
+  const declaredTitle = getDeclaredTitle(identity.source);
+  if (!declaredTitle || declaredTitle.trim() === identity.title) return null;
+  return `Refusing to save: the Pine Editor is bound to saved script "${identity.title}" but the source declares "${declaredTitle}". `
+    + `Saving would overwrite "${identity.title}". Run pine_new first to create a new script, `
+    + `or pass allow_title_mismatch: true if you really intend to update "${identity.title}".`;
+}
+
+async function assertSaveTargetMatchesSource(opts) {
+  const problem = checkSaveTarget(await getEditorIdentity(), opts);
+  if (problem) throw new Error(problem);
+}
+
 // ── Pure / offline functions ──
 
 export function analyze({ source }) {
@@ -281,9 +370,11 @@ export async function setSource({ source }) {
   return { success: true, lines_set: source.split('\n').length };
 }
 
-export async function compile() {
+export async function compile({ allowTitleMismatch = false } = {}) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
+  // These can click Save / "Save and add to chart": never let that land in the wrong script (#395).
+  await assertSaveTargetMatchesSource({ allowTitleMismatch });
 
   const clicked = await evaluate(`
     (function() {
@@ -344,9 +435,11 @@ export async function getErrors() {
   };
 }
 
-export async function save() {
+export async function save({ allowTitleMismatch = false } = {}) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
+  // These can click Save / "Save and add to chart": never let that land in the wrong script (#395).
+  await assertSaveTargetMatchesSource({ allowTitleMismatch });
 
   const c = await getClient();
   await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
@@ -426,9 +519,11 @@ export async function getConsole() {
   return { success: true, entries: entries || [], entry_count: entries?.length || 0 };
 }
 
-export async function smartCompile() {
+export async function smartCompile({ allowTitleMismatch = false } = {}) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
+  // These can click Save / "Save and add to chart": never let that land in the wrong script (#395).
+  await assertSaveTargetMatchesSource({ allowTitleMismatch });
 
   const studiesBefore = await evaluate(`
     (function() {
@@ -506,32 +601,84 @@ export async function smartCompile() {
 }
 
 export async function newScript({ type }) {
+  const menuLabel = SCRIPT_TYPE_MENU_LABELS[type];
+  if (!menuLabel) throw new Error(`Unknown script type "${type}". Use indicator, strategy or library.`);
+
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const typeMap = { indicator: 'indicator', strategy: 'strategy', library: 'library' };
-  const templates = {
-    indicator: '//@version=6\nindicator("My script")\nplot(close)',
-    strategy: '//@version=6\nstrategy("My strategy", overlay=true)\n',
-    library: '//@version=6\n// @description TODO: add library description here\nlibrary("MyLibrary")\n',
-  };
+  // Never write a template into the open script (that overwrote saved scripts, #475):
+  // create a real new document via the editor's script-name dropdown → "Create new" → type.
+  const before = await getEditorIdentity();
+  if (!before) throw new Error('Could not read the Pine Editor script title.');
 
-  const template = templates[type] || templates.indicator;
-
-  // Simply set the source to a new template — this is the most reliable approach
-  const escaped = JSON.stringify(template);
-  const set = await evaluate(`
+  const menuOpened = await evaluate(`
     (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
+      var titleBtn = document.querySelector('${TITLE_BUTTON_SELECTOR}');
+      if (!titleBtn) return false;
+      titleBtn.click();
       return true;
     })()
   `);
+  if (!menuOpened) throw new Error('Pine Editor script title button not found.');
 
-  if (!set) throw new Error('Monaco editor not found. Ensure Pine Editor is open.');
+  const submenuOpened = await pollUntil(() => evaluate(`
+    (function() {
+      var items = document.querySelectorAll('[role="menuitem"]');
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].textContent.trim() !== 'Create new') continue;
+        ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove'].forEach(function(t) {
+          items[i].dispatchEvent(new MouseEvent(t, { bubbles: true }));
+        });
+        return items[i].getAttribute('aria-expanded') === 'true';
+      }
+      return false;
+    })()
+  `));
+  if (!submenuOpened) {
+    await closeMenus();
+    throw new Error('"Create new" menu not found in the Pine Editor script dropdown.');
+  }
 
-  return { success: true, type, action: 'new_script_created', template: typeMap[type] };
+  const typeClicked = await pollUntil(() => evaluate(`
+    (function() {
+      var pattern = ${menuLabel.toString()};
+      var items = document.querySelectorAll('[role="menuitem"]');
+      for (var i = 0; i < items.length; i++) {
+        if (pattern.test(items[i].textContent.trim())) { items[i].click(); return true; }
+      }
+      return false;
+    })()
+  `));
+  if (!typeClicked) {
+    await closeMenus();
+    throw new Error(`"${type}" option not found under "Create new".`);
+  }
+
+  // A new script gets a fresh Monaco model; the old binding must be gone before anyone writes source.
+  const after = await pollUntil(async () => {
+    if (await cancelUnsavedChangesDialog()) return { blockedByUnsavedChanges: true };
+    const current = await getEditorIdentity();
+    const isNewUntitled = current && current.modelUri !== before.modelUri && /^untitled/i.test(current.title);
+    return isNewUntitled ? current : null;
+  }, NEW_SCRIPT_TIMEOUT_MS);
+
+  if (after?.blockedByUnsavedChanges) {
+    throw new Error(
+      `"${before.title}" has unsaved changes, so TradingView asked whether to save them before creating a new script. `
+      + 'Cancelled that prompt to avoid losing or saving those changes. Save or discard them first, then retry pine_new.'
+    );
+  }
+  if (!after) {
+    await closeMenus();
+    const current = await getEditorIdentity();
+    throw new Error(
+      `Could not verify that a new ${type} script was created; the editor is still bound to "${current?.title || before.title}". `
+      + 'Do not set source until pine_new succeeds.'
+    );
+  }
+
+  return { success: true, type, action: 'new_script_created', title: after.title };
 }
 
 export async function openScript({ name }) {

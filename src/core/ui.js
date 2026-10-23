@@ -243,17 +243,26 @@ export async function scroll({ direction, amount }) {
   return { success: true, direction, amount: px };
 }
 
-export async function mouseClick({ x, y, button, double_click }) {
-  const c = await getClient();
+// CDP's `buttons` is a bitmask of the buttons held down (left=1, right=2,
+// middle=4). Sending 0 on mousePressed means "no button pressed", so pages
+// ignored left clicks while the tool still reported success (issue #477).
+const MOUSE_BUTTON_MASKS = { left: 1, right: 2, middle: 4 };
+
+export function mouseButtonMask(button) {
+  return MOUSE_BUTTON_MASKS[button] ?? MOUSE_BUTTON_MASKS.left;
+}
+
+export async function mouseClick({ x, y, button, double_click, _deps }) {
+  const c = await (_deps?.getClient || getClient)();
   const btn = button === 'right' ? 'right' : button === 'middle' ? 'middle' : 'left';
-  const btnNum = btn === 'right' ? 2 : btn === 'middle' ? 1 : 0;
+  const buttons = mouseButtonMask(btn);
   await c.Input.dispatchMouseEvent({ type: 'mouseMoved', x, y });
-  await c.Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: btn, buttons: btnNum, clickCount: 1 });
-  await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: btn });
+  await c.Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: btn, buttons, clickCount: 1 });
+  await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: btn, buttons: 0, clickCount: 1 });
   if (double_click) {
     await new Promise(r => setTimeout(r, 50));
-    await c.Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: btn, buttons: btnNum, clickCount: 2 });
-    await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: btn });
+    await c.Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: btn, buttons, clickCount: 2 });
+    await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: btn, buttons: 0, clickCount: 2 });
   }
   return { success: true, x, y, button: btn, double_click: !!double_click };
 }
@@ -296,7 +305,9 @@ export async function findElement({ query, strategy }) {
   return { success: true, query, strategy: strat, count: results?.length || 0, elements: results || [] };
 }
 
-export async function uiEvaluate({ expression }) {
-  const result = await evaluate(expression);
+export async function uiEvaluate({ expression, _deps }) {
+  // awaitPromise: an async expression otherwise comes back as the serialized
+  // Promise object, i.e. {} (issue #476). Non-promise values are unaffected.
+  const result = await (_deps?.evaluate || evaluate)(expression, { awaitPromise: true });
   return { success: true, result };
 }
