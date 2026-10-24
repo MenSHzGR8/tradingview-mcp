@@ -58,11 +58,13 @@ tv CLI              ┘
 Then restart Claude Code and start TradingView with the `tv_launch` tool (or `TV_CDP_TRANSPORT=pipe tv launch`). `tv_launch` starts the broker, and the broker starts TradingView. `tv_health_check` reports `"transport": "pipe"`.
 
 - **Socket:** `~/Library/Application Support/tradingview-mcp/cdp.sock` on macOS, `$XDG_RUNTIME_DIR/tradingview-mcp/cdp.sock` on Linux. Override with `TV_PIPE_SOCKET`.
+- **Windows:** named pipes share one machine-wide namespace and Node creates them readable by Everyone, so the broker picks a random pipe name each run and writes it, with a random token, to `%LOCALAPPDATA%\tradingview-mcp\pipe.json` (readable only by your account, SYSTEM and Administrators). Clients must present the token before the broker sends or forwards anything. If TradingView can't be run from `WindowsApps`, `tv_launch` falls back to a local copy, as in port mode.
+- **Piping Pine source on Windows:** Windows PowerShell 5.1 pipes text to programs as ASCII and turns non-ASCII characters into `?`. Use `tv pine set --file x.pine` (UTF-8, UTF-16 and ANSI files are all detected), or run `$OutputEncoding = [System.Text.UTF8Encoding]::new()` first. The CLI warns when piped source looks affected.
 - **Broker log:** `broker.log` in the same folder.
 - **Manual start:** `node src/pipe/broker.js [--socket <path>] [--tv <binary>]`.
 - **Joins a running broker:** if the Awesome Charts app (or another session) already runs the broker, `tv_launch` joins it instead of restarting TradingView.
 - **Lifetime:** the broker exits when TradingView quits. Opening TradingView from the Dock or Start menu starts it without any debugger, so use `tv_launch`.
-- **Limits:** only one program can launch TradingView, so tools that start it themselves (or expect port 9222, such as `scripts/pine_*.js`) don't work at the same time. Windows uses a named pipe, but pipe mode has only been tested on macOS.
+- **Limits:** only one program can launch TradingView, so tools that start it themselves (or expect port 9222, such as `scripts/pine_*.js`) don't work at the same time. Windows uses a named pipe; tested live on Windows 11 with TradingView Desktop 3.4.1 (MSIX).
 
 Verified live on TradingView Desktop 3.4.1 (Electron 41) on macOS: every tool group works over the pipe, and `lsof` shows no TCP listener from TradingView or the broker.
 
