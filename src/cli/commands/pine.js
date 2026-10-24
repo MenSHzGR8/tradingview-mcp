@@ -1,12 +1,23 @@
 import { register } from '../router.js';
 import * as core from '../../core/pine.js';
 import { readFileSync } from 'fs';
+import { decodeSource, stdinSourceWarning } from '../source_input.js';
 
 async function readStdin() {
   if (process.stdin.isTTY) return null;
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
-  return Buffer.concat(chunks).toString('utf-8');
+  return decodeSource(Buffer.concat(chunks));
+}
+
+// Run fn with source from --file or stdin; attach a warning if stdin may have lost characters.
+async function withSource(opts, fn) {
+  const source = opts.file ? decodeSource(readFileSync(opts.file)) : await readStdin();
+  if (!source) throw new Error('No source provided. Pipe source via stdin or use --file.');
+  const warning = opts.file ? null : stdinSourceWarning(source);
+  if (warning) process.stderr.write(`Warning: ${warning}\n`);
+  const result = await fn(source);
+  return warning ? { ...result, warning } : result;
 }
 
 register('pine', {
@@ -21,16 +32,7 @@ register('pine', {
       options: {
         file: { type: 'string', short: 'f', description: 'Read source from file' },
       },
-      handler: async (opts) => {
-        let source;
-        if (opts.file) {
-          source = readFileSync(opts.file, 'utf-8');
-        } else {
-          source = await readStdin();
-        }
-        if (!source) throw new Error('No source provided. Pipe source via stdin or use --file.');
-        return core.setSource({ source });
-      },
+      handler: (opts) => withSource(opts, (source) => core.setSource({ source })),
     }],
     ['compile', {
       description: 'Smart compile: detect button, compile, check errors',
@@ -51,32 +53,14 @@ register('pine', {
       options: {
         file: { type: 'string', short: 'f', description: 'Read source from file' },
       },
-      handler: async (opts) => {
-        let source;
-        if (opts.file) {
-          source = readFileSync(opts.file, 'utf-8');
-        } else {
-          source = await readStdin();
-        }
-        if (!source) throw new Error('No source provided. Pipe source via stdin or use --file.');
-        return core.analyze({ source });
-      },
+      handler: (opts) => withSource(opts, (source) => core.analyze({ source })),
     }],
     ['check', {
       description: 'Server-side compile check (no chart needed)',
       options: {
         file: { type: 'string', short: 'f', description: 'Read source from file' },
       },
-      handler: async (opts) => {
-        let source;
-        if (opts.file) {
-          source = readFileSync(opts.file, 'utf-8');
-        } else {
-          source = await readStdin();
-        }
-        if (!source) throw new Error('No source provided. Pipe source via stdin or use --file.');
-        return core.check({ source });
-      },
+      handler: (opts) => withSource(opts, (source) => core.check({ source })),
     }],
     ['save', {
       description: 'Save the current Pine Script (Ctrl+S)',
