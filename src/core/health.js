@@ -8,6 +8,7 @@ import { dirname, basename, join } from 'path';
 import { fileURLToPath } from 'url';
 import { connectBroker } from '../pipe/client.js';
 import { defaultSocketPath, brokerLogPath, stateDir } from '../pipe/paths.js';
+import { EXIT_TV_SPAWN_FAILED } from '../pipe/broker.js';
 
 // Best-effort git-pull update check: compare local HEAD to origin's default
 // branch on GitHub. Never throws — returns null on any failure (offline,
@@ -232,6 +233,18 @@ async function _probeCdp(cdpPort) {
   });
 }
 
+// Kill every TradingView process. Output is discarded: taskkill/pkill complain on
+// stderr when nothing is running, which is the normal case. Returns true if killed.
+function _killTradingView(deps) {
+  const cmd = process.platform === 'win32' ? 'taskkill /F /IM TradingView.exe' : 'pkill -f TradingView';
+  try {
+    deps.execSync(cmd, { timeout: 5000, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false; // may not be running
+  }
+}
+
 function _spawnDetached(spawnFn, exe, args) {
   const child = spawnFn(exe, args, { detached: true, stdio: 'ignore' });
   child.unref();
@@ -327,7 +340,7 @@ export function findTradingViewPath({ _deps, port } = {}) {
     // for normal `dir` enumeration but readable via Get-AppxPackage without elevation.
     try {
       const ps = 'powershell -NoProfile -Command "(Get-AppxPackage -Name \'TradingView.Desktop\' -ErrorAction SilentlyContinue).InstallLocation"';
-      const installDir = deps.execSync(ps, { timeout: 5000 }).toString().trim();
+      const installDir = deps.execSync(ps, { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
       if (installDir) {
         const candidate = `${installDir}\\TradingView.exe`;
         if (deps.existsSync(candidate)) tvPath = candidate;
@@ -338,7 +351,7 @@ export function findTradingViewPath({ _deps, port } = {}) {
   if (!tvPath) {
     try {
       const cmd = platform === 'win32' ? 'where TradingView.exe' : 'which tradingview';
-      tvPath = deps.execSync(cmd, { timeout: 3000 }).toString().trim().split('\n')[0];
+      tvPath = deps.execSync(cmd, { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n')[0];
       if (tvPath && !deps.existsSync(tvPath)) tvPath = null;
     } catch { /* ignore */ }
   }
@@ -368,11 +381,7 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   let tvPath = findTradingViewPath({ _deps, port: cdpPort });
 
   const killExisting = async () => {
-    try {
-      if (platform === 'win32') deps.execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
-      else deps.execSync('pkill -f TradingView', { timeout: 5000 });
-      await deps.delay(1500);
-    } catch { /* may not be running */ }
+    if (_killTradingView(deps)) await deps.delay(1500);
   };
 
   if (killFirst) await killExisting();
@@ -439,53 +448,76 @@ async function _pipeBrokerVersion(socketPath) {
  */
 async function launchPipe({ kill_existing, _deps } = {}) {
   const deps = _resolveLaunchDeps(_deps);
-  const socketPath = defaultSocketPath();
   const platform = process.platform;
+  // On Windows the broker picks a fresh pipe name each run (see pipe/paths.js), so
+  // re-resolve the socket on every probe instead of fixing it up front.
+  const probe = () => deps.probePipe(defaultSocketPath());
 
   // A broker that already answers (this MCP's own, or the Awesome Charts app's) owns TradingView:
   // join it rather than killing TradingView, whatever kill_existing says.
-  const running = await deps.probePipe(socketPath);
+  const running = await probe();
   if (running) {
-    return { success: true, transport: 'pipe', already_running: true, socket: socketPath, browser: running.product };
+    return { success: true, transport: 'pipe', already_running: true, socket: defaultSocketPath(), browser: running.product };
   }
 
-  const tvPath = findTradingViewPath({ _deps });
+  let tvPath = findTradingViewPath({ _deps });
 
   if (kill_existing !== false) {
-    try {
-      if (platform === 'win32') deps.execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
-      else deps.execSync('pkill -f TradingView', { timeout: 5000 });
-    } catch { /* may not be running */ }
+    _killTradingView(deps);
     // An old broker exits once its TradingView is gone; wait for its socket to go quiet.
-    for (let i = 0; i < 10 && await deps.probePipe(socketPath); i++) await deps.delay(500);
+    for (let i = 0; i < 10 && await probe(); i++) await deps.delay(500);
     await deps.delay(1000);
   }
 
   mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
   const logPath = brokerLogPath();
-  const logFd = openSync(logPath, 'a');
-  let child;
-  try {
-    child = deps.spawn(process.execPath, [BROKER_SCRIPT, '--socket', socketPath, '--tv', tvPath], {
-      detached: true, stdio: ['ignore', logFd, logFd],
-    });
-    child.unref();
-  } finally {
-    closeSync(logFd);
-  }
+  const startBroker = (exe) => {
+    const socketArgs = platform === 'win32' && !process.env.TV_PIPE_SOCKET ? [] : ['--socket', defaultSocketPath()];
+    const logFd = openSync(logPath, 'a');
+    try {
+      const child = deps.spawn(process.execPath, [BROKER_SCRIPT, ...socketArgs, '--tv', exe], {
+        detached: true, stdio: ['ignore', logFd, logFd], windowsHide: true,
+      });
+      child.unref();
+      const state = { child, exitCode: null };
+      child.on('exit', (code) => { state.exitCode = code ?? -1; });
+      return state;
+    } finally {
+      closeSync(logFd);
+    }
+  };
 
+  let broker = startBroker(tvPath);
+  let usedLocalCopy = false;
   for (let i = 0; i < 20; i++) {
     await deps.delay(1000);
-    const info = await deps.probePipe(socketPath);
+    if (broker.exitCode === EXIT_TV_SPAWN_FAILED && platform === 'win32' && !usedLocalCopy && WINDOWS_APPS_RE.test(tvPath)) {
+      // This Windows build won't run TradingView from WindowsApps; use a local copy, as port mode does.
+      tvPath = _copyMsixPackageLocal(tvPath, deps);
+      usedLocalCopy = true;
+      broker = startBroker(tvPath);
+      i = -1;
+      continue;
+    }
+    if (broker.exitCode !== null) {
+      return {
+        success: false, transport: 'pipe', platform, binary: tvPath, broker_exit_code: broker.exitCode, broker_log: logPath,
+        ...(usedLocalCopy && { msix_local_copy: true }),
+        error: `Pipe broker exited (code ${broker.exitCode}) before TradingView answered. See the broker log: ${logPath}`,
+      };
+    }
+    const info = await probe();
     if (info) {
       return {
-        success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: child.pid,
-        socket: socketPath, browser: info.product, user_agent: info.userAgent, broker_log: logPath,
+        success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: broker.child.pid,
+        socket: defaultSocketPath(), browser: info.product, user_agent: info.userAgent, broker_log: logPath,
+        ...(usedLocalCopy && { msix_local_copy: true }),
       };
     }
   }
   return {
-    success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: child.pid, socket: socketPath, cdp_ready: false,
+    success: true, transport: 'pipe', platform, binary: tvPath, broker_pid: broker.child.pid, socket: defaultSocketPath(), cdp_ready: false,
+    ...(usedLocalCopy && { msix_local_copy: true }),
     warning: `Broker started but TradingView is not answering yet. Try tv_health_check in a few seconds; broker log: ${logPath}`,
   };
 }
