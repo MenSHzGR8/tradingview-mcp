@@ -2,7 +2,7 @@
  * Core streaming logic — real-time JSONL output from TradingView.
  * Uses efficient poll + dedup: only emits when data changes.
  */
-import { evaluate } from '../connection.js';
+import { evaluate, isPipeTransport, CDP_PORT } from '../connection.js';
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 const MODEL = `${CHART_API}._chartWidget.model()`;
@@ -24,7 +24,9 @@ async function pollLoop(fetcher, { interval = 500, dedupe = true, label = 'strea
   const start = Date.now();
   process.stderr.write(`\u26A0  tradingview-mcp  |  Unofficial tool. Not affiliated with TradingView Inc. or Anthropic.\n`);
   process.stderr.write(`   Streams from your locally running TradingView Desktop instance only.\n`);
-  process.stderr.write(`   Does not connect to TradingView servers. Requires --remote-debugging-port=9222.\n`);
+  process.stderr.write(isPipeTransport()
+    ? `   Does not connect to TradingView servers. Requires TradingView started with tv launch (pipe transport).\n`
+    : `   Does not connect to TradingView servers. Requires --remote-debugging-port=${CDP_PORT}.\n`);
   process.stderr.write(`   Ensure your usage complies with TradingView's Terms of Use.\n`);
   process.stderr.write(`[stream:${label}] started, interval=${interval}ms, Ctrl+C to stop\n`);
 
