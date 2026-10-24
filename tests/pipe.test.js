@@ -40,6 +40,17 @@ function fakeBrowser() {
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
+// Close events arrive later on Windows named pipes (~50-150 ms) than on Unix sockets.
+async function waitFor(cond, timeoutMs = 2000) {
+  const end = Date.now() + timeoutMs;
+  while (!cond() && Date.now() < end) await tick();
+}
+
+// Windows has no socket files: brokers listen on named pipes instead.
+const sockPath = (dir, name) => (process.platform === 'win32'
+  ? `\\\\.\\pipe\\tvp-test-${process.pid}-${Math.random().toString(36).slice(2)}-${name}`
+  : join(dir, name));
+
 describe('framing', () => {
   it('reassembles messages split across chunks and splits joined ones', () => {
     const out = [];
@@ -70,7 +81,7 @@ describe('pipe broker', () => {
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'tvp-'));
-    socketPath = join(dir, 'cdp.sock');
+    socketPath = sockPath(dir, 'cdp.sock');
     browser = fakeBrowser();
     gone = 0;
     broker = await createBroker({ ...browser, socketPath, onBrowserGone: () => { gone++; } });
@@ -133,7 +144,7 @@ describe('pipe broker', () => {
     await attachPipeTarget(conn, 'T1');
     assert.equal(broker.sessionCount, 1);
     conn.close();
-    await tick();
+    await waitFor(() => broker.sessionCount === 0);
     assert.equal(broker.sessionCount, 0);
     assert.ok(browser.received.some((m) => m.method === 'Target.detachFromTarget' && m.params.sessionId === 'S-T1'));
   });
@@ -153,7 +164,7 @@ describe('pipe broker', () => {
   it('stops and removes its socket when the browser pipe closes', async () => {
     const conn = await connectBroker(socketPath);
     browser.fromBrowser.end();
-    await tick();
+    await waitFor(() => gone === 1);
     assert.equal(gone, 1);
     assert.equal(existsSync(socketPath), false);
     await assert.rejects(conn.send('Target.getTargets'), /closed/);
@@ -174,7 +185,11 @@ describe('pipe broker', () => {
   });
 
   it('gives a clear error when no broker is running', async () => {
-    await assert.rejects(connectBroker(join(dir, 'missing.sock')), /pipe broker not reachable.*tv_launch/);
+    await assert.rejects(connectBroker(sockPath(dir, 'missing.sock')), /pipe broker not reachable.*tv_launch/);
+  });
+
+  it('gives a clear error when no broker has recorded a pipe', async () => {
+    await assert.rejects(connectBroker(null), /pipe broker not reachable.*tv_launch/);
   });
 
   it('rejects malformed requests without forwarding them', async () => {
@@ -187,5 +202,73 @@ describe('pipe broker', () => {
     assert.equal(replies[0].error.code, -32600);
     assert.equal(browser.received.length, 0);
     raw.destroy();
+  });
+});
+
+describe('pipe broker with an auth token', () => {
+  const TOKEN = 'a'.repeat(64);
+  let dir;
+  let socketPath;
+  let browser;
+  let broker;
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'tvp-'));
+    socketPath = sockPath(dir, 'auth.sock');
+    browser = fakeBrowser();
+    broker = await createBroker({ ...browser, socketPath, authToken: TOKEN });
+  });
+
+  afterEach(() => {
+    broker.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function rawClient() {
+    const raw = net.createConnection(socketPath);
+    await new Promise((r) => raw.once('connect', r));
+    const replies = [];
+    let closed = false;
+    raw.on('data', createFrameReader((m) => replies.push(m)));
+    raw.on('error', () => {});
+    raw.on('close', () => { closed = true; });
+    return { raw, replies, isClosed: () => closed };
+  }
+
+  it('serves a client that presents the token', async () => {
+    const conn = await connectBroker(socketPath, { token: TOKEN });
+    assert.equal((await listPipeTargets(conn)).length, 2);
+    conn.close();
+  });
+
+  it('drops a client with the wrong token without forwarding anything', async () => {
+    const c = await rawClient();
+    c.raw.write(encodeFrame({ auth: 'b'.repeat(64) }));
+    c.raw.write(encodeFrame({ id: 1, method: 'Target.getTargets' }));
+    await waitFor(c.isClosed);
+    assert.equal(c.isClosed(), true);
+    assert.equal(browser.received.length, 0);
+    assert.deepEqual(c.replies, []);
+  });
+
+  it('drops a client whose first frame is a command', async () => {
+    const c = await rawClient();
+    c.raw.write(encodeFrame({ id: 1, method: 'Target.getTargets' }));
+    await waitFor(c.isClosed);
+    assert.equal(c.isClosed(), true);
+    assert.equal(browser.received.length, 0);
+  });
+
+  it('sends broadcast events only to authenticated clients', async () => {
+    const anon = await rawClient();
+    const authed = await rawClient();
+    authed.raw.write(encodeFrame({ auth: TOKEN }));
+    await waitFor(() => broker.clientCount === 1);
+    browser.reply({ method: 'Target.targetCreated', params: { targetInfo: TARGETS[0] } });
+    await waitFor(() => authed.replies.length === 1);
+    assert.equal(authed.replies[0].method, 'Target.targetCreated');
+    assert.deepEqual(anon.replies, []);
+    anon.raw.destroy();
+    authed.raw.destroy();
   });
 });

@@ -7,18 +7,36 @@
  * events for the target sessions it attached itself. Sessions are detached
  * when their client disconnects.
  *
+ * With an authToken (always on Windows, see paths.js), a client must send
+ * { auth: token } as its first frame; until then it receives nothing and
+ * anything else closes the connection.
+ *
  * Run directly to launch TradingView under the broker:
  *   node src/pipe/broker.js [--socket <path>] [--tv <binary>]
  */
 import net from 'node:net';
 import { spawn } from 'node:child_process';
+import { timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createFrameReader, encodeFrame } from './framing.js';
-import { defaultSocketPath } from './paths.js';
+import {
+  clearPipeInfo, defaultSocketPath, newAuthToken, newWindowsPipeName, stateDir, writePipeInfo,
+} from './paths.js';
 
 const IS_WINDOWS = process.platform === 'win32';
+const AUTH_TIMEOUT_MS = 5000;
+
+/** Broker exit code when TradingView itself could not be started (e.g. EACCES in WindowsApps). */
+export const EXIT_TV_SPAWN_FAILED = 3;
+
+function tokenMatches(given, expected) {
+  if (typeof given !== 'string') return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 function log(...args) {
   process.stderr.write(`[${new Date().toISOString()}] ${args.join(' ')}\n`);
@@ -46,9 +64,10 @@ async function prepareSocketPath(socketPath) {
  * @param {import('node:stream').Writable} opts.toBrowser   browser's fd 3 (we write commands)
  * @param {import('node:stream').Readable} opts.fromBrowser browser's fd 4 (we read replies/events)
  * @param {string} opts.socketPath
+ * @param {string} [opts.authToken] require clients to present this token first
  * @param {() => void} [opts.onBrowserGone]
  */
-export async function createBroker({ toBrowser, fromBrowser, socketPath, onBrowserGone = () => {} }) {
+export async function createBroker({ toBrowser, fromBrowser, socketPath, authToken, onBrowserGone = () => {} }) {
   const clients = new Set();
   const inflight = new Map(); // broker id -> { client, id, method } (client null = broker's own call)
   const sessionOwner = new Map(); // sessionId -> client
@@ -112,13 +131,28 @@ export async function createBroker({ toBrowser, fromBrowser, socketPath, onBrows
     const client = {
       sessions: new Set(),
       isClosed: false,
-      send: (msg) => { if (!client.isClosed) socket.write(encodeFrame(msg)); },
+      authed: !authToken,
+      send: (msg) => { if (!client.isClosed && client.authed) socket.write(encodeFrame(msg)); },
       destroy: () => socket.destroy(),
     };
-    clients.add(client);
-    socket.on('data', createFrameReader((msg) => onClientMessage(client, msg), (err) => log('client:', err.message)));
+    let authTimer = null;
+    if (client.authed) clients.add(client);
+    else authTimer = setTimeout(() => socket.destroy(), AUTH_TIMEOUT_MS);
+    socket.on('data', createFrameReader((msg) => {
+      if (client.authed) return onClientMessage(client, msg);
+      if (client.isClosed) return;
+      if (!tokenMatches(msg?.auth, authToken)) {
+        client.isClosed = true;
+        socket.destroy();
+        return;
+      }
+      clearTimeout(authTimer);
+      client.authed = true;
+      clients.add(client);
+    }, (err) => log('client:', err.message)));
     socket.on('error', () => {});
     socket.on('close', () => {
+      clearTimeout(authTimer);
       client.isClosed = true;
       clients.delete(client);
       for (const sessionId of [...client.sessions]) {
@@ -133,7 +167,10 @@ export async function createBroker({ toBrowser, fromBrowser, socketPath, onBrows
   await prepareSocketPath(socketPath);
   const server = net.createServer(onClientConnection);
   await new Promise((resolve, reject) => {
-    server.once('error', reject);
+    // Windows has no socket file to probe in prepareSocketPath; the pipe name itself is taken.
+    server.once('error', (err) => reject(err.code === 'EADDRINUSE'
+      ? new Error(`A pipe broker is already running on ${socketPath}`)
+      : err));
     server.listen(socketPath, resolve);
   });
   if (!IS_WINDOWS) chmodSync(socketPath, 0o600);
@@ -169,7 +206,7 @@ export async function createBroker({ toBrowser, fromBrowser, socketPath, onBrows
 }
 
 function parseCli(argv) {
-  const opts = { socketPath: defaultSocketPath(), tvPath: null };
+  const opts = { socketPath: null, tvPath: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--socket') opts.socketPath = argv[++i];
     else if (argv[i] === '--tv') opts.tvPath = argv[++i];
@@ -182,19 +219,26 @@ async function main() {
   const opts = parseCli(process.argv.slice(2));
   const { findTradingViewPath } = await import('../core/health.js');
   const tvPath = opts.tvPath || findTradingViewPath();
+  const socketPath = opts.socketPath || (IS_WINDOWS ? newWindowsPipeName() : defaultSocketPath());
+  const authToken = IS_WINDOWS ? newAuthToken() : undefined;
 
   const child = spawn(tvPath, ['--remote-debugging-pipe'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-  child.on('error', (err) => { log('TradingView failed to start:', err.message); process.exit(1); });
+  child.on('error', (err) => { log('TradingView failed to start:', err.message); process.exit(EXIT_TV_SPAWN_FAILED); });
 
   const broker = await createBroker({
     toBrowser: child.stdio[3],
     fromBrowser: child.stdio[4],
-    socketPath: opts.socketPath,
-    onBrowserGone: () => { log('TradingView exited; broker stopping.'); process.exit(0); },
+    socketPath,
+    authToken,
+    onBrowserGone: () => { log('TradingView exited; broker stopping.'); clearPipeInfo(process.pid); process.exit(0); },
   });
-  log(`TradingView ${tvPath} (pid ${child.pid}) on pipe; broker listening on ${opts.socketPath}`);
+  if (authToken) {
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writePipeInfo({ socket: socketPath, token: authToken, pid: process.pid });
+  }
+  log(`TradingView ${tvPath} (pid ${child.pid}) on pipe; broker listening on ${socketPath}`);
 
-  const shutdown = () => { broker.close(); process.exit(0); };
+  const shutdown = () => { broker.close(); clearPipeInfo(process.pid); process.exit(0); };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }

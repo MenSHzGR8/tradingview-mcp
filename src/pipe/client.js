@@ -5,16 +5,20 @@
  */
 import net from 'node:net';
 import { createFrameReader, encodeFrame } from './framing.js';
-import { defaultSocketPath } from './paths.js';
+import { defaultSocketPath, pipeAuthToken } from './paths.js';
 
 const DOMAINS = ['Runtime', 'Page', 'DOM', 'Input', 'Emulation', 'Network', 'Target', 'Browser', 'Log'];
 const COMMAND_TIMEOUT_MS = 60_000;
 
 /**
- * @param {string} [socketPath]
+ * @param {string | null} [socketPath] null when no broker has recorded its pipe (Windows)
+ * @param {{ token?: string }} [opts] auth token; defaults to the one recorded for socketPath
  * @returns {Promise<{ send: (method: string, params?: object, sessionId?: string) => Promise<any>, close: () => void, isClosed: boolean }>}
  */
-export async function connectBroker(socketPath = defaultSocketPath()) {
+export async function connectBroker(socketPath = defaultSocketPath(), { token = pipeAuthToken(socketPath) } = {}) {
+  if (!socketPath) {
+    throw new Error('TradingView pipe broker not reachable (no broker has started). Start it with the tv_launch tool.');
+  }
   const socket = net.createConnection(socketPath);
   await new Promise((resolve, reject) => {
     socket.once('connect', resolve);
@@ -22,6 +26,7 @@ export async function connectBroker(socketPath = defaultSocketPath()) {
       `TradingView pipe broker not reachable at ${socketPath} (${err.code || err.message}). Start it with the tv_launch tool.`,
     )));
   });
+  if (token) socket.write(encodeFrame({ auth: token }));
 
   const pending = new Map();
   let nextId = 1;
